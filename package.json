@@ -1,0 +1,6 @@
+{
+  "name": "shattered-duelist-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vercel Serverless Functions backend for Islands of the Shattered Duelist, backed by Airtable."
+}
