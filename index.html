@@ -190,6 +190,10 @@
   .device.chant-flash{ animation: chantGlowPulse 0.6s ease-out; }
   @keyframes attackLunge{ 0%{ transform: translateY(0) scale(1); } 35%{ transform: translateY(-10px) scale(1.06); } 55%{ transform: translateY(4px) scale(1.03); } 100%{ transform: translateY(0) scale(1); } }
   .slot.lunging{ animation: attackLunge 0.35s ease-out; z-index:3; }
+  .card-reveal-overlay{ position:absolute; inset:0; z-index:70; display:none; align-items:center; justify-content:center; background:rgba(0,0,0,0.7); pointer-events:none; }
+  .card-reveal-overlay .reveal-card-frame{ width:220px; height:220px; border-radius:14px; position:relative; box-shadow: 0 0 50px 12px rgba(212,175,55,0.5); }
+  @keyframes revealPop{ 0%{ transform:scale(0.6); opacity:0; } 15%{ transform:scale(1.05); opacity:1; } 25%{ transform:scale(1); opacity:1; } 85%{ transform:scale(1); opacity:1; } 100%{ transform:scale(0.95); opacity:0; } }
+  .card-reveal-overlay.reveal-anim .reveal-card-frame{ animation: revealPop 1.1s ease; }
 
   .hand-row{ display:flex; gap:7px; overflow-x:auto; margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
   .hand-card{ width:78px; flex-shrink:0; background:var(--panel); border:1px solid var(--line); border-radius:9px; padding:7px; cursor:pointer; }
@@ -394,6 +398,7 @@
           <div class="bar"><div class="bar-fill" id="deck-bar" style="width:0%"></div></div>
           <div style="font-size:12px; font-weight:700; white-space:nowrap;"><span id="deck-count">0</span>/40</div>
         </div>
+        <div id="tutorial-lock-row" style="margin-bottom:12px;"></div>
         <div class="type-tabs">
           <div class="type-tab active" data-type="All">All 80</div>
           <div class="type-tab" data-type="Monster">Monsters</div>
@@ -413,6 +418,7 @@
 
       <!-- DUEL -->
       <div class="screen" id="screen-duel">
+        <div class="card-reveal-overlay" id="card-reveal-overlay"></div>
         <div class="diff-row" id="diff-row"></div>
         <div class="mp-banner" id="mp-banner" style="display:none;"></div>
         <div class="phase-strip" id="phase-strip"></div>
@@ -656,7 +662,7 @@ function saveProgress(){
   try{
     localStorage.setItem(SAVE_KEY, JSON.stringify({
       fragments, playerName, playerAvatar, dailyClaimed,
-      deckCounts, deckTotal, owned, starterExtraPick, activeDeck, rankedWins, masteryPoints, aiDifficulty
+      deckCounts, deckTotal, owned, starterExtraPick, tutorialLocked, activeDeck, rankedWins, masteryPoints, aiDifficulty
     }));
   } catch(e){ /* localStorage unavailable, progress just won't persist */ }
   if(myPlayerCode && appReady) syncProgressToBackend(); // fire-and-forget; no-op if offline or backend not deployed yet
@@ -675,6 +681,7 @@ function loadProgress(){
     starterExtraPick = d.starterExtraPick ?? starterExtraPick;
     activeDeck = d.activeDeck ?? activeDeck;
     rankedWins = d.rankedWins ?? rankedWins;
+    tutorialLocked = d.tutorialLocked ?? tutorialLocked;
     masteryPoints = d.masteryPoints ?? masteryPoints;
     aiDifficulty = d.aiDifficulty ?? aiDifficulty;
     return true;
@@ -882,6 +889,13 @@ function makeCardPool(prefix, count){
     const cost = Math.round(base * RARITY_MULT[rarity] / 5) * 5;
     pool.push({id: prefix+"-"+i, name, type, fx, cost, rarity, monsterType, level, atk, def, tuner});
   }
+  // balance pass: Level 9+ monsters get capped to Level 8 with -400 ATK, per the critiques-answers note
+  pool.forEach(c=>{
+    if(c.type==="Monster" && c.level>=9){
+      c.level = 8;
+      c.atk = Math.max(0, c.atk - 400);
+    }
+  });
   if(prefix === "card" && pool.length){
     pool[0] = Object.assign({}, pool[0], {
       name: "Tritoad", monsterType: "Beast", rarity: "Common", level: 2, atk: 400, def: 500,
@@ -914,6 +928,9 @@ function makeCardPool(prefix, count){
   return pool;
 }
 const deckPool = makeCardPool("card", 80);
+// These stay in deckPool so story/AI logic (Ritual Summon, Milton's signature monster) can still find them by name,
+// but per the critiques-answers note, players can never deck-build or buy them directly.
+const HIDDEN_FROM_PLAYER = ["War-monger Bladesman", "Battle-roid #12"];
 const deckCounts = {};
 let deckTotal = 0;
 
@@ -921,7 +938,7 @@ let deckTotal = 0;
 // live in the Main Deck and are drawn/Ritual Summoned from hand instead, per the mechanics-answers note.
 const extraDeckPool = [
   { id:"extra-1", name:"Chimera Wyrmblade", type:"Monster", monsterType:"Dragon", rarity:"Ultra Rare",
-    level:9, atk:2900, def:2100, summonMethod:"Fusion",
+    level:8, atk:2500, def:2100, summonMethod:"Fusion",
     fx:'Fusion Summon: requires the Chant "Polymerization." Sends 2 Monsters to the Graveyard as Fusion Material.' },
   { id:"extra-2", name:"Starlight Synchron", type:"Monster", monsterType:"Fairy", rarity:"Rare",
     level:6, atk:2300, def:1800, summonMethod:"Synchro",
@@ -935,6 +952,7 @@ const extraDeckPool = [
 ];
 const STARTER_EXTRA_OPTIONS = ["extra-1","extra-2","extra-3","extra-4"]; // Fusion / Synchro / Xyz / Link, per the tutorial-picks note
 let starterExtraPick = "extra-1";
+let tutorialLocked = false;
 
 function cardTags(c){
   const mt = c.monsterType ? `<span class="mtype-tag">${c.monsterType}</span>` : "";
@@ -1007,7 +1025,10 @@ const isleInfo = [
     mentor:null,
     rival:{tag:"REMATCH", name:"Devon Lawrence", note:"Devon returns with a stronger Warrior deck, testing everything you learned on Reedshallow."},
     opponent:null,
-    boss:null },
+    boss:{tag:"ISLAND BOSS", name:"High Flame Priest, Magnussen", traits:"Leader of the Flame Duelists. Arrogant and egotistical — utterly convinced no one on Emberkeep can touch him.",
+      quote:"\"Kneel before the Flame Duelists' finest. You won't even be a memory by tomorrow.\"",
+      defeatQuote:"\"Huh, well... you got lucky cuz I slept bad last night.\"",
+      extra:"His boss monster, \"Pyro-mancer of the Charred Forest\" (Level 8, 3100 ATK / 2800 DEF, Fire), has an effect: once per turn, he may discard a card from his hand to destroy 2 of his opponent's Defense cards."} },
   { name:"Chronwake", desc:"A fractured island where time itself bends. Strongest cards in the story, and home to the final boss. Its 15 minor opponents are collectively known as the \"Minor Elites\" — gruff and rude, with no unique names of their own.",
     origin:"Long ago, the unfathomable raw energy of time split the continent into three islands — Reedshallow, Emberkeep, and Chronwake — and kept pushing them farther apart. A young scientist, Dr. Ashgrove, sealed that energy within a card and used it to begin bringing about peace. But as time went on, he stopped thinking of himself as a scientist and started thinking of himself as a god.",
     music:"🎵 Violin — intensifies during duels",
@@ -1017,7 +1038,7 @@ const isleInfo = [
     boss:{tag:"FINAL BOSS", name:"Dr. Ashgrove, the Chronomancer", traits:"About 50 years old, 5'7\", long gray hair, an abnormally long labcoat. Cold. Calculated. Efficient. A god complex — he believes time manipulation will let him \"fix\" the world.",
       quote:"\"Seeing this is a game, and you're just sitting in a chair on the other side of a screen — my only hope of defeating you is winning by such a wide margin that you give up hope entirely.\"",
       defeatQuote:"\"The world... the world was meant to be peaceful. It was meant to be beautiful. And you have destroyed all that I have built.\"",
-      extra:"His ultimate monster, \"Technochronos, the Cyber Deity,\" is a Level 8 Synchro Monster. Its phase-skip hits both duelists each turn, and Ashgrove chooses which phase to skip fresh each time he uses it — only Technochronos itself gets to attack twice. As the player arrives, Ashgrove has just defeated Prof. Milton in a duel — shown purely through dialogue, no board — Milton falls to his knees: \"I failed. I'm sorry.\" (They were once colleagues.) Once Ashgrove is beaten, he has no further story role — but every other story duel can be replayed anytime, at increased difficulty: a mix of tougher stats and improved decks, with higher Card Fragment rewards to match. Difficulty overall climbs steadily as the story progresses, not just on replays."} },
+      extra:"His ultimate monster, \"Technochronos, the Cyber Deity\" (Level 8 Synchro Monster, 3600 ATK / 3200 DEF), has a phase-skip that hits both duelists each turn, and Ashgrove chooses which phase to skip fresh each time he uses it — only Technochronos itself gets to attack twice. As the player arrives, Ashgrove has just defeated Prof. Milton in a duel — shown purely through dialogue, no board — Milton falls to his knees: \"I failed. I'm sorry.\" (They were once colleagues.) Once Ashgrove is beaten, he has no further story role — but every other story duel can be replayed anytime, at increased difficulty: a mix of tougher stats and improved decks, with higher Card Fragment rewards to match. Difficulty overall climbs steadily as the story progresses, not just on replays."} },
   { name:"Arena Isle", desc:"The multiplayer hub. No story here — just the leaderboard, 30 lobbies, and whichever of your 3 decks you bring. Ranked matchmaking pairs players with similar win/loss records, not just win counts.",
     music:"🎵 Notation — intensifies during duels", mentor:null, rival:null, opponent:null, boss:null }
 ];
@@ -1047,12 +1068,23 @@ document.querySelectorAll(".type-tab").forEach(t=>{
     renderDeckGrid();
   });
 });
+function renderTutorialLockRow(){
+  const row = document.getElementById("tutorial-lock-row");
+  if(!row) return;
+  if(tutorialLocked){
+    row.innerHTML = `<div class="fb-note">✓ Tutorial deck locked in. New cards now come from Merchants (Shop tab) — buy a copy there before it can be slotted here.</div>`;
+  } else {
+    row.innerHTML = `<button class="btn btn-gold" style="width:100%; justify-content:center;" ${deckTotal!==40?"disabled":""} onclick="finishTutorialDeck()">Finish Tutorial Deck${deckTotal!==40 ? ` (${deckTotal}/40)` : ""}</button>`;
+  }
+}
 function renderDeckGrid(){
   const grid = document.getElementById("deck-grid");
   grid.innerHTML = "";
-  const cards = deckPool.filter(c => activeTypeFilter==="All" || c.type===activeTypeFilter);
+  renderTutorialLockRow();
+  const cards = deckPool.filter(c => (activeTypeFilter==="All" || c.type===activeTypeFilter) && !HIDDEN_FROM_PLAYER.includes(c.name));
   cards.forEach(c=>{
     const count = deckCounts[c.id]||0;
+    const canAdd = count<3 && deckTotal<40 && (!tutorialLocked || count < (owned[c.id]||0));
     const div = document.createElement("div");
     div.className = "card";
     div.innerHTML = `
@@ -1060,7 +1092,7 @@ function renderDeckGrid(){
       <div class="count-row">
         <button class="mini-btn" onclick="adjustDeck('${c.id}',-1)" ${count===0?"disabled":""}>–</button>
         <span class="count-pill ${count>0?'has':''}">${count}/3</span>
-        <button class="mini-btn" onclick="adjustDeck('${c.id}',1)" ${count>=3||deckTotal>=40?"disabled":""}>+</button>
+        <button class="mini-btn" onclick="adjustDeck('${c.id}',1)" ${canAdd?"":"disabled"}>+</button>
       </div>`;
     grid.appendChild(div);
   });
@@ -1070,16 +1102,32 @@ function adjustDeck(id, delta){
   const next = cur + delta;
   if(next < 0 || next > 3) return;
   if(delta>0 && deckTotal>=40) return;
-  deckCounts[id] = next;
-  deckTotal += delta;
-  // only the cards a player selects during deck building enter their collection, per the personal-critiques note
-  owned[id] = (owned[id] || 0) + delta;
-  if(owned[id] <= 0) delete owned[id];
+  if(!tutorialLocked){
+    // Tutorial deck-build: freely picking cards grants ownership directly
+    deckCounts[id] = next;
+    deckTotal += delta;
+    owned[id] = (owned[id] || 0) + delta;
+    if(owned[id] <= 0) delete owned[id];
+  } else {
+    // Once the tutorial deck is locked in, the deck can only be built from cards you already own —
+    // more copies come from a Merchant, not from free deck-editing, per the critiques-answers note.
+    if(delta>0 && next > (owned[id]||0)){ alert("You don't own a spare copy of this card — buy one from a Merchant first."); return; }
+    deckCounts[id] = next;
+    deckTotal += delta;
+  }
   const collectionEl = document.getElementById("collection-count");
   if(collectionEl) collectionEl.textContent = Object.values(owned).reduce((a,b)=>a+b,0);
   document.getElementById("deck-count").textContent = deckTotal;
   document.getElementById("deck-bar").style.width = (deckTotal/40*100)+"%";
   renderDeckGrid();
+  saveProgress();
+}
+function finishTutorialDeck(){
+  if(deckTotal !== 40){ alert(`Your deck needs exactly 40 cards before you can finish — you have ${deckTotal}.`); return; }
+  tutorialLocked = true;
+  alert("Tutorial deck locked in! From here, new cards come from Merchants — the Deck Builder now only lets you slot cards you already own.");
+  renderDeckGrid();
+  renderStarterPickGrid();
   saveProgress();
 }
 renderDeckGrid();
@@ -1104,11 +1152,13 @@ function renderStarterPickGrid(){
   STARTER_EXTRA_OPTIONS.forEach(id=>{
     const c = extraDeckPool.find(x=>x.id===id);
     const col = document.createElement("div");
-    col.className = "starter-pick-card" + (starterExtraPick===id ? " picked" : "");
+    col.className = "starter-pick-card" + (starterExtraPick===id ? " picked" : "") + (tutorialLocked ? " locked" : "");
     col.innerHTML = `
       <div class="card-frame" style="${cardBgStyle(c)}">${frameOverlayHTML(c)}<div class="summon-tag">${c.summonMethod}</div></div>
-      <div class="starter-pick-label">${starterExtraPick===id ? "✓ Chosen" : "Choose this one"}</div>`;
-    col.onclick = ()=>{ starterExtraPick = id; renderStarterPickGrid(); renderExtraRow(); saveProgress(); };
+      <div class="starter-pick-label">${starterExtraPick===id ? "✓ Chosen" : (tutorialLocked ? "Locked" : "Choose this one")}</div>`;
+    if(!tutorialLocked){
+      col.onclick = ()=>{ starterExtraPick = id; renderStarterPickGrid(); renderExtraRow(); saveProgress(); };
+    }
     grid.appendChild(col);
   });
 }
@@ -1129,12 +1179,18 @@ let yourLP = 4000;
 let oppLP = 4000;
 let duelOver = false;
 let selectedAttacker = null;
+let hasNormalSummoned = false; // Normal Summon limited to once per turn, per the critiques-answers note
 let aiPool = [];
 let aiHand = [];
+const PYROMANCER_CARD = { id:"boss-pyromancer", name:"Pyro-mancer of the Charred Forest", type:"Monster", monsterType:"Fire", rarity:"Ultra Rare", level:8, atk:3100, def:2800, fx:"Once per turn, Magnussen may discard a card from his hand to destroy 2 of his opponent's Defense cards." };
+const TECHNOCHRONOS_CARD = { id:"boss-technochronos", name:"Technochronos, the Cyber Deity", type:"Monster", monsterType:"Machine", rarity:"Ultra Rare", level:8, atk:3600, def:3200, summonMethod:"Synchro", fx:"Skips a phase for both duelists each turn (Ashgrove's choice) — but only Technochronos itself gets to attack twice." };
 const AI_PROFILES = {
   Squire: { name:"Squire", avatar:"🛡️", lp:3000, levelMin:1, levelMax:4, style:"random" },
   Knight: { name:"Knight", avatar:"⚔️", lp:4000, levelMin:4, levelMax:8, style:"cautious" },
-  "Master Wizard": { name:"Master Wizard", avatar:"🧙‍♂️", lp:4500, levelMin:7, levelMax:12, style:"optimal" }
+  "Master Wizard": { name:"Master Wizard", avatar:"🧙‍♂️", lp:4500, levelMin:7, levelMax:12, style:"optimal" },
+  "Devon Lawrence": { name:"Devon Lawrence", avatar:"⚔️", lp:4000, levelMin:4, levelMax:8, style:"optimal", signature: ()=> deckPool.find(c=>c.name==="War-monger Bladesman") },
+  "Magnussen": { name:"High Flame Priest, Magnussen", avatar:"🔥", lp:4500, levelMin:5, levelMax:8, style:"optimal", signature: ()=> PYROMANCER_CARD },
+  "Dr. Ashgrove": { name:"Dr. Ashgrove", avatar:"⏳", lp:5000, levelMin:6, levelMax:8, style:"optimal", signature: ()=> TECHNOCHRONOS_CARD }
 };
 let aiDifficulty = "Knight";
 
@@ -1165,7 +1221,6 @@ function newHand(){
   return shuffled.slice(0,5);
 }
 function renderDuel(){
-  handCards = handCards.length ? handCards : newHand();
   renderPhaseStrip();
   document.getElementById("you-avatar").textContent = playerAvatar;
   document.getElementById("you-name").textContent = playerName;
@@ -1239,6 +1294,7 @@ function specialSummon(card){
   if(openSlot === -1){ log("Both Extra Monster Zones are full — the Special Summon fizzles."); renderDuel(); return; }
   extraZones[openSlot] = { name: card.name, position: "ATK", level: card.level, atk: card.atk, def: card.def, attacked:false, owner:"you" };
   playThud();
+  showCardReveal(card);
   const defText = (card.def===null||card.def===undefined) ? "—" : card.def;
   log(`<b>${card.summonMethod} Summon!</b> You summon <b>${card.name}</b> (${card.atk}/${defText}) to an Extra Monster Zone.`);
   renderDuel();
@@ -1308,13 +1364,14 @@ function renderMonZone(elId, zone, isYours){
 function renderSTZone(elId, zone){
   const el = document.getElementById(elId);
   el.innerHTML = "";
+  const isYours = elId.startsWith("your");
   zone.forEach((slot, idx)=>{
     const div = document.createElement("div");
     if(!slot){ div.className = "slot"; div.textContent = "Empty"; }
     else{
       div.className = "slot filled Defense";
       div.textContent = "Set (face-down)";
-      div.onclick = ()=> activateDefense(zone, idx, elId);
+      if(isYours) div.onclick = ()=> activateDefense(zone, idx, elId);
     }
     el.appendChild(div);
   });
@@ -1333,6 +1390,7 @@ function playCard(idx){
   if(card.type === "Chant"){
     log(`You cast <b>${card.name}</b> — ${card.fx}. It resolves like a spell, then goes to the graveyard.`);
     flashDevice("chant-flash");
+    showCardReveal(card);
     handCards.splice(idx,1);
     graveCount++;
   } else if(card.type === "Monster"){
@@ -1342,6 +1400,9 @@ function playCard(idx){
     if(card.summonMethod === "Ritual"){
       ritualChantIdx = handCards.findIndex(h=>h.name==="Warring Ritual");
       if(ritualChantIdx===-1){ log(`<b>${card.name}</b> is a Ritual Monster — you need the "Warring Ritual" Chant in your hand too.`); return; }
+    } else if(hasNormalSummoned){
+      log(`You've already Normal Summoned this turn — one per turn.`);
+      return;
     }
     if(tributesNeeded > 0 && filledCount < tributesNeeded){
       log(`<b>${card.name}</b> is Level ${card.level} and needs ${tributesNeeded} tribute${tributesNeeded>1?'s':''} — you don't have enough monsters on the field.`);
@@ -1355,12 +1416,14 @@ function playCard(idx){
     if(slot===-1){ log("Your 5 monster zones are full."); return; }
     yourMon[slot] = { name: card.name, position: "ATK", level: card.level, atk: card.atk, def: card.def, attacked:false };
     playThud();
+    showCardReveal(card);
     log(card.summonMethod==="Ritual"
       ? `<b>Ritual Summon!</b> You summon <b>${card.name}</b> (${card.monsterType}, Lv ${card.level}, ${card.atk}/${card.def}) in Attack position.`
       : `You summon <b>${card.name}</b> (${card.monsterType}, Lv ${card.level}, ${card.atk}/${card.def}) in Attack position. Tap it to flip to Defense.`);
     const indicesToRemove = ritualChantIdx>-1 ? [idx, ritualChantIdx].sort((a,b)=>b-a) : [idx];
     indicesToRemove.forEach(i=>handCards.splice(i,1));
     if(ritualChantIdx>-1){ graveCount++; log(`The "Warring Ritual" Chant is sent to the graveyard.`); }
+    else { hasNormalSummoned = true; }
   } else {
     const slot = yourST.findIndex(s=>!s);
     if(slot===-1){ log("Your 5 spell/trap zones are full."); return; }
@@ -1423,6 +1486,17 @@ function playTrumpet(){
     o.connect(g); g.connect(ctx.destination);
     o.start(start); o.stop(start+0.35);
   });
+}
+function showCardReveal(card){
+  const overlay = document.getElementById("card-reveal-overlay");
+  if(!overlay) return;
+  overlay.innerHTML = `<div class="reveal-card-frame" style="${cardBgStyle(card)}">${frameOverlayHTML(card)}</div>`;
+  overlay.style.display = "flex";
+  overlay.classList.remove("reveal-anim");
+  void overlay.offsetWidth;
+  overlay.classList.add("reveal-anim");
+  clearTimeout(window.__revealTimeout);
+  window.__revealTimeout = setTimeout(()=>{ overlay.style.display = "none"; }, 1100);
 }
 function flashDevice(cls){
   const device = document.querySelector(".device");
@@ -1590,6 +1664,8 @@ function runAiTurn(){
       const slot = oppMon.findIndex(s=>!s);
       if(slot>-1){
         oppMon[slot] = {name:card.name, position:"ATK", level:card.level, atk:card.atk, def:card.def, attacked:false};
+        playThud();
+        showCardReveal(card);
         log(`${profile.name} summons <b>${card.name}</b> (${card.atk}/${card.def}) in Attack position.`);
         aiHand.splice(monsterIdxInHand,1);
       }
@@ -1651,6 +1727,7 @@ function runAiTurn(){
   document.getElementById("turn-num").textContent = turnNum;
   log(`— Turn ${turnNum} begins —`);
   drawPlayerCard();
+  hasNormalSummoned = false;
   yourMon.forEach(s=>{ if(s) s.attacked = false; });
   renderDuel();
   saveProgress();
@@ -1688,12 +1765,21 @@ function startDuel(diffKey){
   oppLP=profile.lp;
   duelOver=false;
   selectedAttacker=null;
+  hasNormalSummoned=false;
   graveCount=0;
   turnNum=1;
   handCards=newHand();
   aiPool = deckPool.filter(c => (c.type!=="Monster" || (c.level>=profile.levelMin && c.level<=profile.levelMax)) && c.summonMethod!=="Ritual");
   aiHand = [];
   for(let i=0;i<5;i++){ if(aiPool.length) aiHand.push(aiPool[Math.floor(Math.random()*aiPool.length)]); }
+  // bosses get their signature monster guaranteed, per the critiques-answers note (NPCs can summon monsters players can't buy)
+  if(profile.signature){
+    const sig = profile.signature();
+    if(sig){
+      aiPool = aiPool.concat([sig]);
+      aiHand[Math.floor(Math.random()*aiHand.length)] = sig;
+    }
+  }
 
   document.getElementById("opp-name").textContent = profile.name;
   document.getElementById("opp-avatar").textContent = profile.avatar;
@@ -1714,7 +1800,10 @@ function startDuel(diffKey){
 startDuel(aiDifficulty);
 
 /* ---------------- shop ---------------- */
-const merchantStocks = [ makeCardPool("m0", 12), makeCardPool("m1", 12), makeCardPool("m2", 12) ];
+const merchantStocks = [ makeCardPool("m0", 12), makeCardPool("m1", 12), makeCardPool("m2", 12) ]
+  .map(pool => pool.filter(c => !HIDDEN_FROM_PLAYER.includes(c.name)));
+// Emberkeep's own shared 125-card pool, mirroring Reedshallow's — ready for when Emberkeep gets its own Merchant screen.
+const EMBERKEEP_MERCHANT_POOL = makeCardPool("ek", 125).filter(c => !HIDDEN_FROM_PLAYER.includes(c.name));
 const owned = {};
 document.querySelectorAll(".merchant-tab").forEach(t=>{
   t.addEventListener("click", ()=>{
